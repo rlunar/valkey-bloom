@@ -1,8 +1,5 @@
 use crate::bloom::utils::BloomFilter;
 use crate::bloom::utils::BloomFilterType;
-use crate::configs::{
-    FIXED_SIP_KEY_ONE_A, FIXED_SIP_KEY_ONE_B, FIXED_SIP_KEY_TWO_A, FIXED_SIP_KEY_TWO_B,
-};
 use crate::metrics::BLOOM_NUM_OBJECTS;
 use crate::metrics::BLOOM_OBJECT_TOTAL_MEMORY_BYTES;
 use crate::wrapper::bloom_callback;
@@ -61,7 +58,6 @@ pub trait ValkeyDataType {
 impl ValkeyDataType for BloomFilterType {
     /// Callback to load and parse RDB data of a bloom item and create it.
     fn load_from_rdb(rdb: *mut raw::RedisModuleIO, encver: i32) -> Option<BloomFilterType> {
-        let mut filters = Vec::new();
         if encver > BLOOM_FILTER_TYPE_ENCODING_VERSION {
             logging::log_warning(format!("{}: Cannot load bloomfltr data type of version {} because it is higher than the loaded module's bloomfltr supported version {}", MODULE_NAME, encver, BLOOM_FILTER_TYPE_ENCODING_VERSION).as_str());
             return None;
@@ -75,24 +71,28 @@ impl ValkeyDataType for BloomFilterType {
         let Ok(fp_rate) = raw::load_double(rdb) else {
             return None;
         };
+        let mut filters: Vec<BloomFilter> = Vec::with_capacity(num_filters as usize);
+
         for i in 0..num_filters {
             let Ok(bitmap) = raw::load_string_buffer(rdb) else {
-                return None;
-            };
-            let Ok(number_of_bits) = raw::load_unsigned(rdb) else {
-                return None;
-            };
-            // Reject RDB Load if any bloom filter within a bloom object of a size greater than what is allowed.
-            if !BloomFilter::validate_size_with_bits(number_of_bits) {
-                logging::log_warning("Failed to restore bloom object because it contains a filter larger than the max allowed size limit.");
-                return None;
-            }
-            let Ok(number_of_hash_functions) = raw::load_unsigned(rdb) else {
                 return None;
             };
             let Ok(capacity) = raw::load_unsigned(rdb) else {
                 return None;
             };
+            let new_fp_rate = match Self::calculate_fp_rate(fp_rate, num_filters as i32) {
+                Ok(rate) => rate,
+                Err(_) => {
+                    logging::log_warning(
+                        "Failed to restore bloom object: Reached max number of filters",
+                    );
+                    return None;
+                }
+            };
+            if !BloomFilter::validate_size(capacity as u32, new_fp_rate) {
+                logging::log_warning("Failed to restore bloom object because it contains a filter larger than the max allowed size limit.");
+                return None;
+            }
             // Only load num_items when it's the last filter
             let num_items = if i == num_filters - 1 {
                 match raw::load_unsigned(rdb) {
@@ -102,18 +102,8 @@ impl ValkeyDataType for BloomFilterType {
             } else {
                 capacity
             };
-            let sip_keys = [
-                (FIXED_SIP_KEY_ONE_A, FIXED_SIP_KEY_ONE_B),
-                (FIXED_SIP_KEY_TWO_A, FIXED_SIP_KEY_TWO_B),
-            ];
-            let filter = BloomFilter::from_existing(
-                bitmap.as_ref(),
-                number_of_bits,
-                number_of_hash_functions as u32,
-                sip_keys,
-                num_items as u32,
-                capacity as u32,
-            );
+            let filter =
+                BloomFilter::from_existing(bitmap.as_ref(), num_items as u32, capacity as u32);
             filters.push(filter);
         }
         BLOOM_OBJECT_TOTAL_MEMORY_BYTES.fetch_add(
@@ -134,11 +124,7 @@ impl ValkeyDataType for BloomFilterType {
         dig.add_long_long(self.expansion.into());
         dig.add_string_buffer(&self.fp_rate.to_le_bytes());
         for filter in &self.filters {
-            dig.add_string_buffer(&filter.bloom.bitmap());
-            for &(key1, key2) in &filter.sip_keys() {
-                dig.add_long_long(key1 as i64);
-                dig.add_long_long(key2 as i64);
-            }
+            dig.add_string_buffer(filter.bloom.as_slice());
             dig.add_long_long(filter.num_items.into());
             dig.add_long_long(filter.capacity.into());
         }

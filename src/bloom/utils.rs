@@ -5,10 +5,11 @@ use crate::{
     metrics,
 };
 use bloomfilter;
+use bloomfilter::{deserialize, serialize};
 use serde::{Deserialize, Serialize};
-use std::{mem, sync::atomic::Ordering};
 
 use super::data_type::BLOOM_TYPE_VERSION;
+use std::{mem, sync::atomic::Ordering};
 
 /// KeySpace Notification Events
 pub const ADD_EVENT: &str = "bloom.add";
@@ -104,7 +105,7 @@ impl BloomFilterType {
 
     /// Create a new BloomFilterType object from an existing one.
     pub fn create_copy_from(from_bf: &BloomFilterType) -> BloomFilterType {
-        let mut filters = Vec::new();
+        let mut filters: Vec<BloomFilter> = Vec::with_capacity(from_bf.filters.len());
         metrics::BLOOM_NUM_OBJECTS.fetch_add(1, Ordering::Relaxed);
         metrics::BLOOM_OBJECT_TOTAL_MEMORY_BYTES.fetch_add(
             mem::size_of::<BloomFilterType>(),
@@ -188,11 +189,9 @@ impl BloomFilterType {
             }
             // Scale out by adding a new filter with capacity bounded within the u32 range. false positive rate is also
             // bound within the range f64::MIN_POSITIVE <= x < 1.0.
-            let new_fp_rate = match self.fp_rate * configs::TIGHTENING_RATIO.powi(num_filters) {
-                x if x > f64::MIN_POSITIVE => x,
-                _ => {
-                    return Err(BloomError::MaxNumScalingFilters);
-                }
+            let new_fp_rate = match Self::calculate_fp_rate(self.fp_rate, num_filters) {
+                Ok(rate) => rate,
+                Err(e) => return Err(e),
             };
             let new_capacity = match filter.capacity.checked_mul(self.expansion) {
                 Some(new_capacity) => new_capacity,
@@ -228,6 +227,14 @@ impl BloomFilterType {
                 Ok(final_vec)
             }
             Err(_) => Err(BloomError::EncodeBloomFilterFailed),
+        }
+    }
+
+    /// Calculate the false positive rate for the Nth filter using tightening ratio.
+    pub fn calculate_fp_rate(fp_rate: f64, num_filters: i32) -> Result<f64, BloomError> {
+        match fp_rate * configs::TIGHTENING_RATIO.powi(num_filters) {
+            x if x > f64::MIN_POSITIVE => Ok(x),
+            _ => Err(BloomError::MaxNumScalingFilters),
         }
     }
 
@@ -318,6 +325,7 @@ impl BloomFilterType {
 /// well within the u32::MAX limit.
 #[derive(Serialize, Deserialize)]
 pub struct BloomFilter {
+    #[serde(serialize_with = "serialize", deserialize_with = "deserialize")]
     pub bloom: bloomfilter::Bloom<[u8]>,
     pub num_items: u32,
     pub capacity: u32,
@@ -330,7 +338,8 @@ impl BloomFilter {
             capacity as usize,
             fp_rate,
             &configs::FIXED_SEED,
-        );
+        )
+        .expect("We expect bloomfilter::Bloom<[u8]> creation to succeed");
         let fltr = BloomFilter {
             bloom,
             num_items: 0,
@@ -346,20 +355,10 @@ impl BloomFilter {
     }
 
     /// Create a new BloomFilter from dumped information (RDB load).
-    pub fn from_existing(
-        bitmap: &[u8],
-        number_of_bits: u64,
-        number_of_hash_functions: u32,
-        sip_keys: [(u64, u64); 2],
-        num_items: u32,
-        capacity: u32,
-    ) -> BloomFilter {
-        let bloom = bloomfilter::Bloom::from_existing(
-            bitmap,
-            number_of_bits,
-            number_of_hash_functions,
-            sip_keys,
-        );
+    pub fn from_existing(bitmap: &[u8], num_items: u32, capacity: u32) -> BloomFilter {
+        let bloom = bloomfilter::Bloom::from_slice(bitmap)
+            .expect("We expect bloomfilter::Bloom<[u8]> creation to succeed");
+
         let fltr = BloomFilter {
             bloom,
             num_items,
@@ -377,7 +376,7 @@ impl BloomFilter {
     }
 
     pub fn number_of_bytes(&self) -> usize {
-        std::mem::size_of::<BloomFilter>() + (self.bloom.number_of_bits() / 8) as usize
+        std::mem::size_of::<BloomFilter>() + (self.bloom.len() / 8) as usize
     }
 
     /// Caculates the number of bytes that the bloom filter will require to be allocated.
@@ -392,17 +391,6 @@ impl BloomFilter {
         true
     }
 
-    /// Caculates the number of bytes that the bloom filter will require to be allocated using provided `number_of_bits`.
-    /// This is used before actually creating the bloom filter when checking if the filter is within the allowed size.
-    /// Returns whether the bloom filter is of a valid size or not.
-    pub fn validate_size_with_bits(number_of_bits: u64) -> bool {
-        let bytes = std::mem::size_of::<BloomFilter>() as u64 + number_of_bits;
-        if bytes > configs::BLOOM_MEMORY_LIMIT_PER_FILTER.load(Ordering::Relaxed) as u64 {
-            return false;
-        }
-        true
-    }
-
     pub fn check(&self, item: &[u8]) -> bool {
         self.bloom.check(item)
     }
@@ -411,20 +399,9 @@ impl BloomFilter {
         self.bloom.set(item)
     }
 
-    pub fn sip_keys(&self) -> [(u64, u64); 2] {
-        self.bloom.sip_keys()
-    }
-
     /// Create a new BloomFilter from an existing BloomFilter object (COPY command).
     pub fn create_copy_from(bf: &BloomFilter) -> BloomFilter {
-        BloomFilter::from_existing(
-            &bf.bloom.bitmap(),
-            bf.bloom.number_of_bits(),
-            bf.bloom.number_of_hash_functions(),
-            bf.bloom.sip_keys(),
-            bf.num_items,
-            bf.capacity,
-        )
+        BloomFilter::from_existing(&bf.bloom.to_bytes(), bf.num_items, bf.capacity)
     }
 }
 
@@ -453,9 +430,7 @@ impl Drop for BloomFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configs::{
-        FIXED_SIP_KEY_ONE_A, FIXED_SIP_KEY_ONE_B, FIXED_SIP_KEY_TWO_A, FIXED_SIP_KEY_TWO_B,
-    };
+    use configs::FIXED_SEED;
     use rand::{distributions::Alphanumeric, Rng};
 
     /// Returns random string with specified number of characters.
@@ -545,10 +520,6 @@ mod tests {
         fp_margin: f64,
         rand_prefix: &String,
     ) {
-        let expected_sip_keys = [
-            (FIXED_SIP_KEY_ONE_A, FIXED_SIP_KEY_ONE_B),
-            (FIXED_SIP_KEY_TWO_A, FIXED_SIP_KEY_TWO_B),
-        ];
         assert_eq!(
             restored_bloom_filter_type.capacity(),
             original_bloom_filter_type.capacity()
@@ -572,8 +543,8 @@ mod tests {
                 .filters
                 .iter()
                 .any(
-                    |filter| (filter.bloom.sip_keys() == restore_filter.bloom.sip_keys())
-                        && (restore_filter.bloom.sip_keys() == expected_sip_keys)
+                    |filter| (filter.bloom.seed() == restore_filter.bloom.seed())
+                        && (restore_filter.bloom.seed() == FIXED_SEED)
                 )));
         assert!(restored_bloom_filter_type
             .filters
@@ -589,7 +560,7 @@ mod tests {
             .all(|restore_filter| original_bloom_filter_type
                 .filters
                 .iter()
-                .any(|filter| filter.bloom.bitmap() == restore_filter.bloom.bitmap())));
+                .any(|filter| filter.bloom.as_slice() == restore_filter.bloom.as_slice())));
         let (error_count, _) = check_items_exist(
             restored_bloom_filter_type,
             1,
@@ -735,14 +706,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sip_keys() {
+    fn test_seed() {
         // The value of sip keys generated by the sip_keys with fixed seed should be equal to the constant in configs.rs
         let test_bloom_filter = BloomFilter::new(0.5_f64, 1000_u32);
-        let test_sip_keys = test_bloom_filter.bloom.sip_keys();
-        assert_eq!(test_sip_keys[0].0, FIXED_SIP_KEY_ONE_A);
-        assert_eq!(test_sip_keys[0].1, FIXED_SIP_KEY_ONE_B);
-        assert_eq!(test_sip_keys[1].0, FIXED_SIP_KEY_TWO_A);
-        assert_eq!(test_sip_keys[1].1, FIXED_SIP_KEY_TWO_B);
+        let seed = test_bloom_filter.bloom.seed();
+        assert_eq!(seed, FIXED_SEED);
     }
 
     #[test]
