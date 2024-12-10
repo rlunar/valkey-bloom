@@ -4,7 +4,8 @@ from valkey_bloom_test_case import ValkeyBloomTestCaseBase
 from valkeytests.conftest import resource_port_tracker
 from util.waiters import *
 
-DEFAULT_BLOOM_FILTER_SIZE = 179960
+DEFAULT_BLOOM_FILTER_SIZE = 179976
+
 DEFAULT_BLOOM_FILTER_CAPACITY = 100000
 class TestBloomMetrics(ValkeyBloomTestCaseBase):
 
@@ -135,5 +136,4 @@ class TestBloomMetrics(ValkeyBloomTestCaseBase):
         restored_info_obj = new_client.execute_command('BF.INFO key1')
         for i in range(1, len(original_info_obj), 2):
             assert original_info_obj[i] == restored_info_obj[i]
-
         self.verify_bloom_metrics(new_client.execute_command("INFO bf"), original_info_obj[3] + DEFAULT_BLOOM_FILTER_SIZE, 2, 3, 7501, 21000 + DEFAULT_BLOOM_FILTER_CAPACITY)

@@ -1,12 +1,9 @@
 use crate::bloom::utils::BloomFilter;
 use crate::bloom::utils::BloomFilterType;
 use crate::configs;
-use crate::metrics::BLOOM_NUM_OBJECTS;
-use crate::metrics::BLOOM_OBJECT_TOTAL_MEMORY_BYTES;
 use crate::wrapper::bloom_callback;
 use crate::wrapper::digest::Digest;
 use crate::MODULE_NAME;
-use std::mem;
 use std::os::raw::c_int;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::{logging, raw};
@@ -71,14 +68,18 @@ impl ValkeyDataType for BloomFilterType {
         let Ok(fp_rate) = raw::load_double(rdb) else {
             return None;
         };
+
         let Ok(tightening_ratio) = raw::load_double(rdb) else {
             return None;
         };
-        let mut filters: Vec<BloomFilter> = Vec::with_capacity(num_filters as usize);
         let Ok(is_seed_random_u64) = raw::load_unsigned(rdb) else {
             return None;
         };
         let is_seed_random = is_seed_random_u64 == 1;
+        // We start off with capacity as 1 to match the same expansion of the vector that would have occurred during bloom
+        // object creation and scaling as a result of BF.* operations.
+        let mut filters = Vec::with_capacity(1);
+
         for i in 0..num_filters {
             let Ok(bitmap) = raw::load_string_buffer(rdb) else {
                 return None;
@@ -114,13 +115,9 @@ impl ValkeyDataType for BloomFilterType {
                 logging::log_warning("Failed to restore bloom object: Object in fixed seed mode, but seed does not match FIXED_SEED.");
                 return None;
             }
-            filters.push(filter);
+            filters.push(Box::new(filter));
         }
-        BLOOM_OBJECT_TOTAL_MEMORY_BYTES.fetch_add(
-            mem::size_of::<BloomFilterType>(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        BLOOM_NUM_OBJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let item = BloomFilterType {
             expansion: expansion as u32,
             fp_rate,
@@ -128,6 +125,7 @@ impl ValkeyDataType for BloomFilterType {
             is_seed_random,
             filters,
         };
+        item.bloom_filter_type_incr_metrics_on_new_create();
         Some(item)
     }
 
