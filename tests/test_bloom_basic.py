@@ -364,3 +364,15 @@ class TestBloomBasic(ValkeyBloomTestCaseBase):
             assert self.client.execute_command('CONFIG SET bf.bloom-tightening-ratio 1.75') == b'ERR (0 < tightening ratio range < 1)'
         except ResponseError as e:
             assert str(e) == f"CONFIG SET failed (possibly related to argument 'bf.bloom-tightening-ratio') - ERR (0 < tightening ratio range < 1)"
+
+    def test_bloom_dump_and_restore(self):
+        """
+        This is a test that validates the bloom data has same debug digest value before and after using restore command
+        """     
+        client = self.server.get_new_client()
+        client.execute_command('BF.INSERT original error 0.001 capacity 2000 items 1')
+        dump = client.execute_command('DUMP original')
+        dump_digest = client.execute_command('DEBUG DIGEST-VALUE original')
+        client.execute_command('RESTORE', 'copy', 0, dump)
+        restore_digest = client.execute_command('DEBUG DIGEST-VALUE copy')
+        assert restore_digest == dump_digest
